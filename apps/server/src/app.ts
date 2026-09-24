@@ -1,5 +1,6 @@
 import cors from 'cors'
 import express from 'express'
+import helmet from 'helmet'
 import { prisma } from './db/prisma'
 import { env } from './env'
 import { errorHandler, notFoundHandler } from './middleware/error'
@@ -16,6 +17,12 @@ import { ensureUploadDir, UPLOAD_DIR, UPLOAD_URL_PREFIX } from './storage'
 export function createApp() {
   const app = express()
   app.disable('x-powered-by')
+
+  app.use(
+    // 图片必须允许跨源读取：web 端跑在 5173、接口在 3000，helmet 默认的
+    // Cross-Origin-Resource-Policy: same-origin 会直接把 <img> 拦成破图。
+    helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }),
+  )
 
   app.use(
     cors({

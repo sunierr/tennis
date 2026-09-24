@@ -126,15 +126,6 @@ function normalizeTags(tags: string[]): string[] {
 }
 
 export async function createPost(input: CreatePostInput, authorId: number): Promise<PostDetail> {
-  const latest = await prisma.post.findFirst({
-    where: { authorId },
-    orderBy: { createdAt: 'desc' },
-    select: { createdAt: true },
-  })
-  if (latest && Date.now() - latest.createdAt.getTime() < POST_COOLDOWN_MS) {
-    throw tooManyRequests('发帖太频繁了，等一会儿再发')
-  }
-
   // 图片宽高由服务端从落盘文件量出来（客户端只回传 url），量不到就留空
   const measured = await Promise.all(
     input.imageUrls.map(async (url) => ({ url, size: await measureStoredImage(url) })),
@@ -142,6 +133,20 @@ export async function createPost(input: CreatePostInput, authorId: number): Prom
   const tags = normalizeTags(input.tags)
 
   const created = await prisma.$transaction(async (tx) => {
+    // 冷却校验必须和插入在同一个事务里，并且先锁住「作者本人这一行」作为串行点。
+    // 否则两个并发请求会同时读到「还没有新帖」，双双通过校验，限流形同虚设。
+    await tx.$queryRaw`SELECT id FROM User WHERE id = ${authorId} FOR UPDATE`
+
+    // 这里刻意用加锁读而不是 tx.post.findFirst：普通查询走事务快照，
+    // 在并发下可能读不到另一个事务刚刚提交的帖子，会漏判冷却窗口。
+    const latest = await tx.$queryRaw<Array<{ createdAt: Date }>>`
+      SELECT createdAt FROM Post WHERE authorId = ${authorId} ORDER BY createdAt DESC LIMIT 1 FOR UPDATE
+    `
+    const last = latest[0]
+    if (last && Date.now() - last.createdAt.getTime() < POST_COOLDOWN_MS) {
+      throw tooManyRequests('发帖太频繁了，等一会儿再发')
+    }
+
     const post = await tx.post.create({
       data: {
         authorId,

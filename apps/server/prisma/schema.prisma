@@ -242,7 +242,9 @@ model Tag {
   id   Int    @id @default(autoincrement())
   // 中文标签直接以 name 做唯一键，不引入 slug
   name String @unique @db.VarChar(20)
-  // 冗余计数：热门标签排序用。当前用 _count 排序，此字段暂不写入（保留按方案留位）
+  // 冗余计数：热门标签排序用。当前热门排序走 _count(PostTag) 现算，此字段一律不写入。
+  // 若要启用，必须与 _count 的口径完全一致（只数 status=ACTIVE 的帖子），否则热门榜会虚高，
+  // 用户点进去看到空流。改这个字段前先看 README「社区」一节。
   postCount Int @default(0)
 
   posts PostTag[]

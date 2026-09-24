@@ -7,6 +7,7 @@ import { Router } from 'express'
 import multer from 'multer'
 import { badRequest } from '../../lib/http-error'
 import { requireAuth } from '../../middleware/auth'
+import { uploadLimiter } from '../../middleware/rate-limit'
 import { saveImage } from '../../storage'
 
 const MAX_SIZE = 5 * 1024 * 1024
@@ -16,6 +17,8 @@ const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp']
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: MAX_SIZE, files: 1 },
+  // 这道 mimetype 检查只是「早退」：mimetype 来自请求头，客户端能随便伪造。
+  // 真正的判定在 storage.saveImage 里读文件头做内容嗅探。
   fileFilter: (_req, file, callback) => {
     if (!ALLOWED_MIME.includes(file.mimetype)) {
       callback(badRequest('只支持 jpg / png / webp 图片'))
@@ -38,9 +41,9 @@ function singleImage(req: Request, res: Response, next: NextFunction): void {
 
 const router = Router()
 
-router.post('/', requireAuth, singleImage, async (req, res) => {
+router.post('/', uploadLimiter, requireAuth, singleImage, async (req, res) => {
   if (!req.file) throw badRequest('请选择要上传的图片')
-  res.status(201).json(await saveImage(req.file.buffer, req.file.mimetype))
+  res.status(201).json(await saveImage(req.file.buffer))
 })
 
 export default router

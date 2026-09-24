@@ -9,7 +9,16 @@ import AuthPanel from '../components/auth/AuthPanel.vue'
 const route = useRoute()
 const user = useUserStore()
 
-const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : ''
+// redirect 来自 URL query，是攻击者可控的输入，不能直接丢给 router.push：
+// 否则 /login?redirect=https://evil.com 就成了一个「登录完跳去钓鱼站」的跳板。
+// 只放行站内路径：必须以单个 / 开头（挡掉 //evil.com 这种协议相对地址）。
+function safeRedirect(raw: unknown): string {
+  if (typeof raw !== 'string') return ''
+  if (!raw.startsWith('/') || raw.startsWith('//')) return ''
+  return raw
+}
+
+const redirect = safeRedirect(route.query.redirect)
 
 function onSuccess(): void {
   if (redirect) {

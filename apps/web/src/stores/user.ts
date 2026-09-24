@@ -4,7 +4,7 @@ import type { AuthResponse, CurrentUser, LoginInput, RegisterInput, UpdateProfil
 import { api } from '../api'
 import { clearToken, readToken, writeToken } from '../platform/storage'
 import { setUnauthorizedHandler } from '../platform/http'
-import { disconnect as disconnectRealtime } from '../platform/realtime'
+import { disconnect as disconnectRealtime, setAuthFailedHandler } from '../platform/realtime'
 
 export const useUserStore = defineStore('user', () => {
   // token 是「是否已登录」的唯一判据（守卫、header、报名都读它）
@@ -36,6 +36,10 @@ export const useUserStore = defineStore('user', () => {
 
   // 401 时由 http 层回调：清会话，页面据 isLoggedIn 自动回落到未登录形态
   setUnauthorizedHandler(clearSession)
+
+  // WS 握手被拒（4401）与 HTTP 401 是同一件事：token 已失效。
+  // 少了这条，用户会停在「页面看着还是登录态、消息永远不再来」的假在线状态。
+  setAuthFailedHandler(clearSession)
 
   // 启动时用 token 换回用户信息：/users/me 是用户数据的唯一真相源
   async function hydrate(): Promise<void> {

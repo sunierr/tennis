@@ -73,6 +73,11 @@ npm run build:web     # 前端产物
 
 - 成功直接返回资源或分页对象 `{ items, total, page, pageSize, hasMore }`；错误统一 `{ code, message, details? }`，`message` 是可直接展示的中文。
 - 错误码：`400 VALIDATION_ERROR` / `401 UNAUTHORIZED` / `403 FORBIDDEN` / `404 NOT_FOUND` / `409 ACCOUNT_EXISTS|ALREADY_JOINED|MATCH_FULL|MATCH_NOT_OPEN` / `429 RATE_LIMITED` / `500 INTERNAL_ERROR`（不泄漏堆栈）。
+- **限流**（`429 RATE_LIMITED`）分两层，阈值见 `src/middleware/rate-limit.ts`：
+  - 按来源 IP 的固定窗口计数（登录 5 分钟 10 次、注册 1 小时 5 次、上传 1 分钟 30 次、发帖/评论 1 分钟 20 次、发消息 1 分钟 60 次）。计数存内存，**多实例部署需要换共享 store**，否则实际阈值会被实例数放大。
+  - 需要按「人」区分的场景（同一用户 60 秒 1 帖）不用内存计数，而是在事务内加行锁判断，见下一节社区。
+  - 本机反复试错时容易把自己限住：重启后端进程即可复位（内存计数）。
+- 安全头由 `helmet` 统一注入；`Cross-Origin-Resource-Policy` 特意设为 `cross-origin`，否则 web 端（5173）加载后端（3000）的上传图片会被浏览器拦成破图。
 - 鉴权：`Authorization: Bearer <jwt>`，payload `{ sub: userId }`，30 天有效。
 - 响应**绝不含** `account` / `password` / `creatorId`；约球里的发起人只暴露 `{ id, nickname, levelTenths, city }`，由 serializer 白名单强制。
 - `fee` 是 `Decimal(10,2)` 且**可空**，serializer 必须转换后再返回（否则前端拿到 `"60.00"` 字符串）；`null` 只出现在「其他」费用且发起人没写金额时。
@@ -96,18 +101,20 @@ npm run build:web     # 前端产物
 
 - 删帖是**软删**（`status = DELETED`），行保留、信息流按 `status = ACTIVE` 过滤，作者删完立刻从流里消失且详情返回 404（仅作者可删，他人 403）。
 - 点赞数 / 评论数**不落库**，由 Prisma `_count` 现算；点赞用 `upsert` 保证连点幂等，取消点赞用 `DELETE`（重复取消不报错）。
-- 同一用户 **60 秒 1 帖**（`429 RATE_LIMITED`）。判据是「查该作者最近一帖的 `createdAt`」而不是内存计数器 —— 多实例安全。
+- 同一用户 **60 秒 1 帖**（`429 RATE_LIMITED`）。判据是「查该作者最近一帖的 `createdAt`」，且**校验与插入在同一个事务内**：先 `SELECT id FROM User WHERE id = ? FOR UPDATE` 锁住作者本人这一行作为串行点，再用加锁读取最近一帖。不这么做的话，两个并发请求会同时读到「还没有新帖」而双双通过，限流形同虚设。
 - 标签最多 3 个，以中文 `name` 直接做唯一键（不引入 slug），按 `name` upsert 后连 `PostTag`。热门标签用 `_count` 排序且只数 `ACTIVE` 帖子 —— 否则软删的帖子会把用户带进空流。
 - `Tag.postCount` 冗余计数**建了但不写入**：当前用 `_count` 排序已够，预留给将来的性能优化，不提前背双写一致性的负担。
 - `PostStatus.HIDDEN` 是预留位，本期不做审核后台。
 
 ### 图片上传
 
-- `POST /api/uploads`：multipart 单文件，字段名 `file`，**≤ 5MB**、仅 `jpg/png/webp`，返回 `{ url, width?, height? }`。
+- `POST /api/uploads`：multipart 单文件，字段名 `file`，**≤ 5MB**、仅 `jpg/png/webp`，返回 `{ url, width, height }`。
 - 存储走本地磁盘 `apps/server/uploads/` + `express.static` 挂在 `/uploads`（`maxAge 7d`；文件名是 UUID，内容不可变所以敢长缓存）。该目录启动时自动创建，已写进 `.gitignore`。
+- **「是不是图片」由服务端读文件头判定**（magic bytes：JPEG `FF D8 FF` / PNG `89 50 4E 47` / WEBP `RIFF....WEBP`），`Content-Type` 只用来早退、不作数 —— 客户端能把任意文件标成 `image/png`。落盘顺序是「先校验内容 → 再量尺寸 → 最后写盘」，任一环节失败都不会留下垃圾文件。
+- 帖子与聊天里的图片地址必须是**本站上传接口给出的地址**（`storage.isStoredImageUrl` 校验 origin + `/uploads/` 前缀 + UUID 文件名）：否则发帖人或组员可以让所有读者的浏览器去请求他指定的域，等于站内追踪器。
 - **返回给前端的必须是绝对 URL**（`PUBLIC_BASE_URL` 拼接）——小程序 `<image>` 没有「当前域名」概念，相对路径 `/uploads/x.jpg` 加载不出来。
 - 文件名由服务端用 `randomUUID()` 生成，**不接受客户端传来的名字** —— 从根上杜绝路径穿越，也避开中文名/空格的兼容问题。
-- 宽高由服务端在落库时量（客户端只回传 `url`，尺寸不让前端说了算），用于前端按真实比例撑开占位、图片加载时不跳高；量不出来（损坏/非图片）不影响上传成功，前端退化成固定比例。
+- 宽高由服务端在落盘时量（客户端只回传 `url`，尺寸不让前端说了算），用于前端按真实比例撑开占位、图片加载时不跳高；量不出来说明文件已损坏，直接拒绝上传。
 - 迁移 OSS 时只需重写 `apps/server/src/storage/index.ts` 这一个文件 + 跑一次数据搬迁：数据库只存 URL，不含任何本地路径假设。
 
 ## 目录结构
@@ -163,6 +170,47 @@ design/prototype.html      视觉基准（不参与构建，token 值取自它�
 - 登录态只存 token（key 仍是 `match_point_token`），用户信息以 `GET /users/me` 为唯一真相源——不把昵称当会话状态存。
 - 详情页参数只传 `id`，其余从接口取（小程序只能传 query string）。
 - 前端产物里**没有任何随包图片资源**：网球 logo 与全部图标都是 CSS / 内联 SVG 绘制，迁移天然极低。社区与聊天里的图片都来自用户上传（存绝对 URL），迁移时 `img → image` 即可。
+
+## 生产部署清单
+
+按单实例部署逐条核对（准备多实例时先解决文末「单实例约束」）。
+
+**环境变量**（`apps/server/.env`）
+
+| 变量 | 生产取值 |
+|---|---|
+| `DATABASE_URL` | 用独立库账号，不要 root |
+| `JWT_SECRET` | 重新生成至少 32 位随机串，**不要沿用开发值**（换了等于全体下线） |
+| `CORS_ORIGIN` | 前端真实来源，如 `https://match.example.com`；`NODE_ENV=production` 时不填会直接启动失败 |
+| `PUBLIC_BASE_URL` | 后端对外基地址，如 `https://api.match.example.com`。**必须是绝对地址**，否则新上传的图片返回的 URL 会指向 localhost |
+| `PORT` | 默认 3000，前面有反向代理时不需要对外暴露 |
+
+**数据库**
+
+- 建库时显式指定 `CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`。
+- 生产用 `npx prisma migrate deploy` 应用既有迁移；`migrate dev` 会尝试重置库并生成新迁移，**只在开发环境用**。
+- 部署后确认 `npx prisma generate` 跑过（缺少生成步骤时运行时会报「PrismaClient 上不存在属性 post」这类错）。
+- `npm --prefix apps/server run seed` 是**清库重建**（12 张业务表全清），生产禁止执行。
+
+**构建与进程**
+
+- 前端：`npm run build:web` 出静态产物，交 Nginx / 静态托管。
+- 后端：**当前仓库没有产物构建脚本**，`package.json` 的 `start`（`node dist/main.js`）是预留位——`tsconfig` 的 `paths` 让 server 直接消费 `packages/shared` 源码，`tsc` 产物里的 `@shared/*` 说明符在运行时解析不了。生产就按开发的方式用 `tsx` 起，进程交给 pm2 / systemd 常驻（配崩溃重启与开机自启）；`tsx watch` 只用于开发。
+
+**反向代理与 HTTPS**
+
+- HTTPS 在 Nginx / Caddy 层终结，后端只监听内网；前端与 API 同源，或把来源写进 `CORS_ORIGIN`。
+- `/ws` 必须透传升级头并放宽读超时，否则心跳会被代理掐断：`proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; proxy_read_timeout 300s;`
+- `/uploads/` 是公开只读静态资源，不要再叠一层鉴权或改写缓存策略。
+
+**备份**
+
+- `apps/server/uploads/` 与数据库**必须一起备份**：库里只存 URL，图丢了 URL 就是死链（挂独立数据盘、随库一起做快照最省事）。
+- 迁 OSS 时先搬文件、再批量改 `PostImage.url` 与 `Message.content`（都是绝对 URL，一条 SQL 就能改），最后切 `src/storage/index.ts` 的实现。
+
+**单实例约束**
+
+- WS 订阅表与限流计数都在**进程内存**里：多实例部署必须先补 Redis pub/sub（广播）与共享限流 store，否则 A 实例发的消息推不到连在 B 实例的用户，限流阈值也会被实例数放大。
 
 ## 已知取舍
 

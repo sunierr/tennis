@@ -6,6 +6,7 @@ import type {
   SendMessageInput,
 } from '@shared/types/chat'
 import { currentUserId, requireAuth } from '../../middleware/auth'
+import { messageLimiter } from '../../middleware/rate-limit'
 import { validate } from '../../middleware/validate'
 import { broadcastMessage } from '../../realtime/gateway'
 import {
@@ -37,7 +38,7 @@ router.get('/:id/messages', validate(messageQuerySchema, 'query'), async (req, r
 })
 
 // 发消息走 HTTP 落库，成功后再向该会话的在线组员广播（WS 只负责加速）
-router.post('/:id/messages', validate(sendMessageSchema), async (req, res) => {
+router.post('/:id/messages', messageLimiter, validate(sendMessageSchema), async (req, res) => {
   const id = parseConversationId(req.params.id)
   const message = await sendMessage(id, currentUserId(req), req.validated as SendMessageInput)
   await broadcastMessage(id, message)

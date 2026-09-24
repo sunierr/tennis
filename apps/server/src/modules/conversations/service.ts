@@ -2,7 +2,7 @@
 // 一切读写判据只有一条 —— ConversationMember.leftAt 为空才算组员；
 // 退出报名后立即失去读写权，重新报名自动恢复（不删行）。
 
-import type { Prisma } from '@prisma/client'
+import { Prisma } from '@prisma/client'
 import type {
   ChatMessage,
   ConversationListItem,
@@ -78,6 +78,37 @@ async function buildListItem(
   return toConversationListItem({ conversation, viewerUserId, lastMessage, unreadCount })
 }
 
+// 每个会话的最后一条消息：固定两条查询（groupBy 取最大 id → 按 id 取回整行），
+// 与「我参与了几个会话」无关。原来是每个会话各查一次。
+async function loadLastMessages(conversationIds: number[]): Promise<Map<number, MessageWithSender>> {
+  const grouped = await prisma.message.groupBy({
+    by: ['conversationId'],
+    where: { conversationId: { in: conversationIds } },
+    _max: { id: true },
+  })
+  const lastIds = grouped.map((row) => row._max.id).filter((id): id is number => id !== null)
+  if (lastIds.length === 0) return new Map()
+
+  const rows = await prisma.message.findMany({ where: { id: { in: lastIds } }, include: messageInclude })
+  return new Map(rows.map((row) => [row.conversationId, row]))
+}
+
+// 未读数：每个会话要比的是各自的 lastReadMessageId，Prisma 的 groupBy 表达不了
+// 「逐行用不同阈值过滤」，只能下推成一条带 join 的 SQL（与报名/发帖的 FOR UPDATE 同样是收口在 service 的 raw SQL）。
+async function loadUnreadCounts(conversationIds: number[], userId: number): Promise<Map<number, number>> {
+  const rows = await prisma.$queryRaw<Array<{ conversationId: number; unread: bigint }>>`
+    SELECT m.conversationId AS conversationId, COUNT(*) AS unread
+    FROM Message m
+    JOIN ConversationMember cm
+      ON cm.conversationId = m.conversationId AND cm.userId = ${userId}
+    WHERE m.senderId <> ${userId}
+      AND (cm.lastReadMessageId IS NULL OR m.id > cm.lastReadMessageId)
+      AND m.conversationId IN (${Prisma.join(conversationIds)})
+    GROUP BY m.conversationId
+  `
+  return new Map(rows.map((row) => [row.conversationId, Number(row.unread)]))
+}
+
 export async function listConversations(userId: number): Promise<ConversationListItem[]> {
   const memberships = await prisma.conversationMember.findMany({
     where: { userId, leftAt: null },
@@ -85,30 +116,28 @@ export async function listConversations(userId: number): Promise<ConversationLis
   })
   if (memberships.length === 0) return []
 
-  const lastReadByConversation = new Map(memberships.map((m) => [m.conversationId, m.lastReadMessageId]))
-  const conversations = await prisma.conversation.findMany({
-    where: { id: { in: memberships.map((m) => m.conversationId) } },
-    include: conversationInclude,
-  })
+  const conversationIds = memberships.map((membership) => membership.conversationId)
 
-  // 每个会话各取「最后一条 + 未读数」：数量级是「我参与的球局数」（几十条以内），
-  // 这里不做聚合优化换取可读性；真出现性能问题再换 groupBy 或冗余计数。
-  const items = await Promise.all(
-    conversations.map(async (conversation) => {
-      const [lastMessage, unreadCount] = await Promise.all([
-        prisma.message.findFirst({
-          where: { conversationId: conversation.id },
-          orderBy: { id: 'desc' },
-          include: messageInclude,
-        }),
-        countUnread(conversation.id, userId, lastReadByConversation.get(conversation.id) ?? null),
-      ])
-      return toConversationListItem({ conversation, viewerUserId: userId, lastMessage, unreadCount })
+  const [conversations, unreadByConversation] = await Promise.all([
+    prisma.conversation.findMany({ where: { id: { in: conversationIds } }, include: conversationInclude }),
+    loadUnreadCounts(conversationIds, userId),
+  ])
+  const lastMessages = await loadLastMessages(conversationIds)
+
+  const items = conversations.map((conversation) =>
+    toConversationListItem({
+      conversation,
+      viewerUserId: userId,
+      lastMessage: lastMessages.get(conversation.id) ?? null,
+      unreadCount: unreadByConversation.get(conversation.id) ?? 0,
     }),
   )
 
-  // 有消息的按时间倒序，一个字没说的沉底
-  return items.sort((a, b) => Date.parse(b.lastMessageAt ?? '') - Date.parse(a.lastMessageAt ?? ''))
+  // 有消息的按时间倒序，一个字没说的沉底。
+  // 空值不能直接参与比较：Date.parse('') 是 NaN，比较器一旦返回 NaN 就被当成「相等」，
+  // 排到哪儿取决于上游的查询顺序 —— 这里显式把「没有消息」当 0，排到所有真实时间戳之后。
+  const timestamp = (value: string | null) => (value === null ? 0 : Date.parse(value))
+  return items.sort((a, b) => timestamp(b.lastMessageAt) - timestamp(a.lastMessageAt))
 }
 
 export async function openDirectConversation(userId: number, peerUserId: number): Promise<ConversationListItem> {

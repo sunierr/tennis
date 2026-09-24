@@ -14,6 +14,7 @@ const CLOSE_UNAUTHORIZED = 4401
 
 type MessageHandler = (message: ChatMessage, conversationId: number) => void
 type ReconnectHandler = () => void
+type AuthFailedHandler = () => void
 
 let socket: WebSocket | null = null
 let retryDelay = RETRY_MIN
@@ -25,6 +26,8 @@ let connectedOnce = false
 const handlersByConversation = new Map<number, Set<MessageHandler>>()
 const allHandlers = new Set<MessageHandler>()
 const reconnectHandlers = new Set<ReconnectHandler>()
+// 握手被服务端拒绝时通知上层（由 stores/user 注册为清会话）
+let authFailedHandler: AuthFailedHandler | null = null
 
 function dispatch(raw: unknown): void {
   if (typeof raw !== 'string') return
@@ -50,11 +53,14 @@ function scheduleReconnect(): void {
   // 没人订阅时不保持长连接（例如退出登录后）
   if (stopped || retryTimer !== null || (allHandlers.size === 0 && handlersByConversation.size === 0)) return
 
+  // 指数退避：1s → 2s → 4s … 30s 封顶，再叠加 ±20% 抖动。
+  // 抖动不是装饰：服务端重启后所有在线客户端会在同一拍醒来，
+  // 没有随机化就是一次整齐的重连风暴。
+  const delay = retryDelay * (0.8 + Math.random() * 0.4)
   retryTimer = setTimeout(() => {
     retryTimer = null
     connect()
-  }, retryDelay)
-  // 指数退避：1s → 2s → 4s … 30s 封顶
+  }, delay)
   retryDelay = Math.min(retryDelay * 2, RETRY_MAX)
 }
 
@@ -76,7 +82,13 @@ function connect(): void {
 
   ws.onclose = (event) => {
     if (socket === ws) socket = null
-    if (event.code === CLOSE_UNAUTHORIZED) return
+    if (event.code === CLOSE_UNAUTHORIZED) {
+      // token 已被服务端拒绝：光是不重连还不够，本地登录态也得清掉，
+      // 否则页面继续以为自己在线，用户看到的是「消息不再来但没有任何提示」。
+      stopped = true
+      authFailedHandler?.()
+      return
+    }
     scheduleReconnect()
   }
 
@@ -113,6 +125,11 @@ export function onReconnect(handler: ReconnectHandler): () => void {
   return () => {
     reconnectHandlers.delete(handler)
   }
+}
+
+// 握手被拒（4401）时触发：与 HTTP 401 同一条处理路径，由 stores/user 注册
+export function setAuthFailedHandler(handler: AuthFailedHandler | null): void {
+  authFailedHandler = handler
 }
 
 // 退出登录时调用：停止重连并断开，避免用失效 token 反复握手

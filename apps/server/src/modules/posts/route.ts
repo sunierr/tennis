@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import type { CreateCommentInput, CreatePostInput, PostListQuery } from '@shared/types/post'
 import { currentUserId, optionalAuth, requireAuth } from '../../middleware/auth'
+import { commentLimiter, postCreateLimiter } from '../../middleware/rate-limit'
 import { validate } from '../../middleware/validate'
 import { createCommentSchema, createPostSchema, parsePostId, postListQuerySchema } from './schema'
 import { createComment, createPost, deletePost, getPostDetail, likePost, listPosts, unlikePost } from './service'
@@ -16,7 +17,7 @@ router.get('/:id', optionalAuth, async (req, res) => {
   res.json(await getPostDetail(parsePostId(req.params.id), req.auth?.userId ?? null))
 })
 
-router.post('/', requireAuth, validate(createPostSchema), async (req, res) => {
+router.post('/', postCreateLimiter, requireAuth, validate(createPostSchema), async (req, res) => {
   res.status(201).json(await createPost(req.validated as CreatePostInput, currentUserId(req)))
 })
 
@@ -33,7 +34,7 @@ router.delete('/:id/like', requireAuth, async (req, res) => {
   res.json(await unlikePost(parsePostId(req.params.id), currentUserId(req)))
 })
 
-router.post('/:id/comments', requireAuth, validate(createCommentSchema), async (req, res) => {
+router.post('/:id/comments', commentLimiter, requireAuth, validate(createCommentSchema), async (req, res) => {
   const id = parsePostId(req.params.id)
   res.status(201).json(await createComment(id, currentUserId(req), req.validated as CreateCommentInput))
 })

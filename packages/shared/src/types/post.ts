@@ -44,7 +44,8 @@ export interface PostCommentItem {
 }
 
 export interface PostDetail extends PostListItem {
-  // 详情页只带前 20 条：更多评论留在信息流外，MVP 不做评论分页
+  // 只是首屏快照（前 20 条），不是全集：需要翻更多评论时走独立的分页接口，
+  // 不要把这里的长度当成评论总数（总数看 commentCount）。
   comments: PostCommentItem[]
 }
 

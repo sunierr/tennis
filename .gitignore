@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+.env.local
+*.log
+.DS_Store
+.trae/
+# 本地上传的图片：开发期产物，不入库（文件名由服务端生成，属于运行数据）
+apps/server/uploads/
