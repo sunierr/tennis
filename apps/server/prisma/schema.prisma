@@ -1,0 +1,285 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// 约球状态：只表达创建者意图。「满员」是 JOINED 人数与 capacity 的派生结果，不落库。
+enum MatchStatus {
+  OPEN
+  CANCELLED
+  FINISHED
+}
+
+// 报名状态：软取消，允许退出后重新报名（复用同一行）
+enum ParticipantStatus {
+  JOINED
+  CANCELLED
+}
+
+enum Surface {
+  HARD
+  CLAY
+  GRASS
+  INDOOR
+}
+
+// 赛制：决定可加入人数上限（capacity 的默认来源）
+enum MatchFormat {
+  SINGLES // 1 对 1 → capacity 2
+  DOUBLES // 2 对 2 → capacity 4
+  TRAINING // 练习 / 找陪练 → capacity 由发布者选 2..6
+}
+
+// 费用三态：场地费由谁承担
+enum FeeType {
+  TREAT // 我请客：发起人承担，别人 0 元
+  AA // AA：人均分摊，fee 必填且 > 0
+  OTHER // 其他：以备注文字为准，fee 可空
+}
+
+// 会话类型：每场球局一个群聊 + 任意两人一个单聊
+enum ConversationType {
+  GROUP
+  DIRECT
+}
+
+enum MessageType {
+  TEXT
+  IMAGE
+  SYSTEM
+}
+
+model User {
+  id       Int    @id @default(autoincrement())
+  account  String @unique @db.VarChar(64)
+  password String @db.VarChar(100) // bcrypt hash
+  nickname String @db.VarChar(20)
+
+  // 自评 NTRP × 10，取值 10..70（35 = 3.5 级）；null = 未填写
+  levelTenths Int?
+  city        String? @db.VarChar(32)
+  district    String? @db.VarChar(32)
+  bio         String? @db.VarChar(140)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  matches      MatchPost[]
+  participants MatchParticipant[]
+  // 会话成员行不随退出删除（leftAt 标记），所以这里是历史全部成员关系
+  conversationMembers ConversationMember[]
+  sentMessages        Message[]
+  posts               Post[]
+  postLikes           PostLike[]
+  comments            Comment[]
+
+  @@index([city, levelTenths])
+}
+
+model MatchPost {
+  id           Int     @id @default(autoincrement())
+  title        String  @db.VarChar(60)
+  city         String  @db.VarChar(32)
+  venue        String  @db.VarChar(80)
+  venueAddress String? @db.VarChar(160)
+  lat          Float?
+  lng          Float?
+
+  startsAt        DateTime // 存 UTC
+  durationMinutes Int      @default(120)
+  // 人均费用：TREAT 恒为 0；AA 必填且 > 0；OTHER 可空（金额与说明写进 notes）
+  fee             Decimal? @db.Decimal(10, 2)
+  feeType         FeeType  @default(AA)
+  format          MatchFormat @default(DOUBLES)
+  // 含发起人的总人数：发起人创建时即占 1 个名额，满员判据是 participantCount >= capacity
+  capacity        Int
+  surface         Surface  @default(HARD)
+
+  // 可接受的 NTRP 区间（×10）；单值场景令 min === max
+  levelMinTenths   Int
+  levelMaxTenths   Int
+  beginnerFriendly Boolean @default(false)
+  notes            String? @db.VarChar(400)
+
+  status MatchStatus @default(OPEN)
+
+  creatorId Int
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  creator      User               @relation(fields: [creatorId], references: [id])
+  participants MatchParticipant[]
+  // 一场球局最多一个群聊（matchId @unique 是这条约束的落库形式）
+  conversation Conversation?
+
+  @@index([status, startsAt])
+  @@index([city, status, startsAt])
+  @@index([levelMinTenths, levelMaxTenths])
+  @@index([creatorId, startsAt])
+}
+
+model MatchParticipant {
+  id      Int               @id @default(autoincrement())
+  matchId Int
+  userId  Int
+  status  ParticipantStatus @default(JOINED)
+  note    String?           @db.VarChar(100)
+
+  // 报名时的水平快照：让「队内水平分布」可回溯，不随用户后续改自评而漂移
+  levelAtJoinTenths Int?
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  cancelledAt DateTime?
+
+  match MatchPost @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  user  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([matchId, userId])
+  @@index([userId, status, createdAt])
+  @@index([matchId, status])
+}
+
+// —— 聊天（阶段 9）：一场球一个群聊，任意两人一个单聊 ——
+model Conversation {
+  id   Int              @id @default(autoincrement())
+  type ConversationType
+  // GROUP 绑定球局；DIRECT 为 null。@unique 保证「一场球只有一个群」
+  matchId Int? @unique
+  // DIRECT 专用：「minId:maxId」保证两人之间只有一个会话，重复点私聊不会刷出一堆空会话
+  pairKey String? @unique @db.VarChar(32)
+  // 会话列表排序用；每次发消息更新，避免列表页为了排序去 join Message
+  lastMessageAt DateTime?
+  createdAt     DateTime  @default(now())
+
+  match    MatchPost?           @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  members  ConversationMember[]
+  messages Message[]
+
+  @@index([lastMessageAt])
+}
+
+model ConversationMember {
+  id             Int @id @default(autoincrement())
+  conversationId Int
+  userId         Int
+  // 未读用「消息 id > lastReadMessageId」算，比时间戳可靠（同秒多条会漏读）
+  lastReadMessageId Int?
+  // 退出报名时标记而不是删行：重新报名可以清空恢复，历史消息的发送者身份也留得住
+  leftAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([conversationId, userId])
+  @@index([userId, leftAt])
+  @@index([conversationId, leftAt])
+}
+
+model Message {
+  id             Int         @id @default(autoincrement())
+  conversationId Int
+  senderId       Int
+  type           MessageType @default(TEXT)
+  // IMAGE 时存图片 URL（绝对地址），TEXT 时存正文
+  content        String      @db.VarChar(1000)
+  createdAt      DateTime    @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender       User         @relation(fields: [senderId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, id])
+}
+
+// —— 社区（阶段 10）：发帖 + 多图 + 标签 + 点赞 + 评论 ——
+// HIDDEN 预留（不做审核后台），DELETED 是软删：作者删帖后从信息流消失，行仍保留
+enum PostStatus {
+  ACTIVE
+  HIDDEN
+  DELETED
+}
+
+model Post {
+  id       Int        @id @default(autoincrement())
+  authorId Int
+  content  String     @db.VarChar(2000)
+  status   PostStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+
+  author   User        @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  images   PostImage[]
+  tags     PostTag[]
+  likes    PostLike[]
+  comments Comment[]
+
+  // 信息流的主查询就是「按状态过滤 + 时间倒序」，索引与查询一一对应
+  @@index([status, createdAt])
+}
+
+model PostImage {
+  id        Int    @id @default(autoincrement())
+  postId    Int
+  // 绝对地址（PUBLIC_BASE_URL 拼好），小程序 <image> 可直接加载
+  url       String @db.VarChar(255)
+  sortOrder Int    @default(0)
+  // 预留占位防抖：前端拿到宽高后按比例撑开，图片加载时不跳高
+  width     Int?
+  height    Int?
+
+  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  @@index([postId, sortOrder])
+}
+
+model Tag {
+  id   Int    @id @default(autoincrement())
+  // 中文标签直接以 name 做唯一键，不引入 slug
+  name String @unique @db.VarChar(20)
+  // 冗余计数：热门标签排序用。当前用 _count 排序，此字段暂不写入（保留按方案留位）
+  postCount Int @default(0)
+
+  posts PostTag[]
+}
+
+model PostTag {
+  postId Int
+  tagId  Int
+
+  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  tag  Tag  @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([postId, tagId])
+  @@index([tagId])
+}
+
+model PostLike {
+  postId    Int
+  userId    Int
+  createdAt DateTime @default(now())
+
+  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([postId, userId])
+}
+
+model Comment {
+  id       Int    @id @default(autoincrement())
+  postId   Int
+  authorId Int
+  content  String @db.VarChar(500)
+
+  createdAt DateTime @default(now())
+
+  post   Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  author User @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@index([postId, createdAt])
+}

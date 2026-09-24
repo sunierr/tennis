@@ -1,0 +1,14 @@
+{
+  "name": "@match-point/shared",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.30",
+    "tsx": "4.20.4",
+    "typescript": "5.8.3"
+  }
+}

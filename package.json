@@ -1,0 +1,13 @@
+{
+  "name": "match-point",
+  "private": true,
+  "scripts": {
+    "dev:web": "npm --prefix apps/web run dev",
+    "dev:server": "npm --prefix apps/server run dev",
+    "build:web": "npm --prefix apps/web run build",
+    "test:shared": "npm --prefix packages/shared run test",
+    "typecheck": "npm --prefix packages/shared run typecheck && npm --prefix apps/server run typecheck && npm --prefix apps/web run typecheck",
+    "prisma:generate": "npm --prefix apps/server exec prisma generate",
+    "prisma:migrate": "npm --prefix apps/server exec prisma migrate dev"
+  }
+}
